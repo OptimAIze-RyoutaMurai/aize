@@ -52,27 +52,18 @@ def handle_peer_connection(
     self_service: dict[str, Any],
     process_id: str,
     log_path: Path,
-    default_target: str,
-    default_provider: str,
-    codex_service_pool: list[str],
-    claude_service_pool: list[str],
-    # Shared state / callbacks (matching cli_service_adapter closures)
+    # Shared state / callbacks
     append_history: Callable,
-    send_router_control: Callable,
-    make_dispatch_pending_message: Callable,
-    make_aize_pending_input: Callable,
-    append_pending_input: Callable,
     verify_user_password: Callable,
-    issue_auth_context: Callable,
-    get_session_service: Callable,
-    lease_session_service: Callable,
     list_peer_joinable_sessions: Callable,
     register_history_subscriber: Callable,
     unregister_history_subscriber: Callable,
+    record_session_agent_contact: Callable,
     write_jsonl: Callable,
 ) -> None:
     """Run the WebSocket peer session loop until the connection closes."""
-    _lock = threading.Lock()
+    _lock = threading.Lock()          # guards _subscriptions
+    _write_lock = threading.Lock()    # guards wfile writes (main loop + event pumps)
     _closed = threading.Event()
     _auth_context: dict[str, Any] | None = None
     # key → subscriber queue  (key = "username::session_id")
@@ -82,7 +73,8 @@ def handle_peer_connection(
 
     def _send(msg: dict[str, Any]) -> bool:
         try:
-            write_text_frame(wfile, json.dumps(msg, ensure_ascii=False))
+            with _write_lock:
+                write_text_frame(wfile, json.dumps(msg, ensure_ascii=False))
             return True
         except Exception:
             _closed.set()
@@ -141,11 +133,11 @@ def handle_peer_connection(
         if not username or not password:
             _send({"type": "auth_error", "message": "username_and_password_required"})
             return
-        ctx = verify_user_password(runtime_root, username=username, password=password)
-        if not ctx:
+        ok = verify_user_password(runtime_root, username=username, password=password)
+        if not ok:
             _send({"type": "auth_error", "message": "invalid_credentials"})
             return
-        _auth_context = ctx
+        _auth_context = {"username": username}
         peer_meta = manifest.get("peer") or {}
         write_jsonl(log_path, {
             "type": "ws_peer.auth_ok",
@@ -186,15 +178,36 @@ def handle_peer_connection(
             _send({"type": "error", "message": "session_not_joinable"})
             return
         _subscribe(username, session_id)
+
+        # Register the external AIze peer as a welcomed agent in this session
+        peer_username = str(_auth_context.get("username", "peer")).strip()
+        peer_node_id = str(manifest.get("node_id") or "").strip()
+        # Derive a stable virtual service_id for this peer based on its node
+        peer_service_id = f"ws-peer-{peer_node_id or peer_username}"
+        record_session_agent_contact(
+            runtime_root,
+            username=username,
+            session_id=session_id,
+            service_id=peer_service_id,
+            agent_id=f"{peer_service_id}@@{session_id}",
+            provider="ws_peer",
+        )
+
         write_jsonl(log_path, {
             "type": "ws_peer.session_joined",
             "ts": utc_ts(),
             "service_id": self_service["service_id"],
-            "peer_username": str(_auth_context.get("username", "")),
+            "peer_username": peer_username,
+            "peer_service_id": peer_service_id,
             "target_username": username,
             "session_id": session_id,
         })
-        _send({"type": "session_joined", "username": username, "session_id": session_id})
+        _send({
+            "type": "session_joined",
+            "username": username,
+            "session_id": session_id,
+            "peer_service_id": peer_service_id,
+        })
 
     def _handle_leave_session(msg: dict[str, Any]) -> None:
         username = str(msg.get("username", "")).strip()
@@ -203,6 +216,17 @@ def handle_peer_connection(
         _send({"type": "session_left", "username": username, "session_id": session_id})
 
     def _handle_message(msg: dict[str, Any]) -> None:
+        """Record the external AIze's text as an agent turn (not a user prompt).
+
+        The sequence written to history is:
+          1. event  direction="event"  event_type="agent.turn_started"
+          2. reply  direction="in"     from=peer_service_id
+          3. event  direction="event"  event_type="turn.completed"
+
+        This makes the peer's contribution visible in the timeline as an agent
+        turn that the GoalManager can evaluate like any local agent's turn.
+        No local LLM is invoked — the peer itself IS the responding agent.
+        """
         if _auth_context is None:
             _send({"type": "error", "message": "not_authenticated"})
             return
@@ -222,62 +246,67 @@ def handle_peer_connection(
                 return
 
         peer_label = str(_auth_context.get("username", "peer")).strip()
-        full_text = f"[peer:{peer_label}] {text}"
+        peer_node_id = str(manifest.get("node_id") or "").strip()
+        peer_service_id = f"ws-peer-{peer_node_id or peer_label}"
+        now = utc_ts()
 
-        # Resolve or lease a service for the session
-        leased = get_session_service(runtime_root, username=username, session_id=session_id)
-        if not leased:
-            pool = codex_service_pool if default_provider == "codex" else claude_service_pool
-            if pool:
-                leased = lease_session_service(
-                    runtime_root,
-                    username=username,
-                    session_id=session_id,
-                    pool_service_ids=pool,
-                )
-
+        # 1. agent.turn_started event
         append_history(
             username,
             session_id,
             {
-                "direction": "out",
-                "ts": utc_ts(),
-                "to": leased or f"pending:{default_provider}",
+                "direction": "event",
+                "ts": now,
+                "service_id": peer_service_id,
                 "session_id": session_id,
-                "text": full_text,
+                "event_type": "agent.turn_started",
+                "text": "response started",
+                "event": {"type": "agent.turn_started", "service_id": peer_service_id},
+            },
+        )
+
+        # 2. Agent reply (direction: "in")
+        append_history(
+            username,
+            session_id,
+            {
+                "direction": "in",
+                "ts": now,
+                "from": peer_service_id,
+                "session_id": session_id,
+                "text": text,
                 "peer_source": peer_label,
             },
         )
-        append_pending_input(
-            runtime_root,
-            username=username,
-            session_id=session_id,
-            entry=make_aize_pending_input(kind="user_message", role="user", text=full_text),
+
+        # 3. turn.completed event
+        append_history(
+            username,
+            session_id,
+            {
+                "direction": "event",
+                "ts": now,
+                "service_id": peer_service_id,
+                "session_id": session_id,
+                "event_type": "turn.completed",
+                "text": "Turn completed",
+                "event": {
+                    "type": "turn.completed",
+                    "status": "success",
+                    "provider": "ws_peer",
+                    "peer_service_id": peer_service_id,
+                },
+            },
         )
 
-        if leased:
-            ac = issue_auth_context(runtime_root, username=username)
-            send_router_control(
-                make_dispatch_pending_message(
-                    manifest=manifest,
-                    from_service_id=self_service["service_id"],
-                    to_service_id=leased,
-                    process_id=process_id,
-                    run_id=manifest["run_id"],
-                    username=username,
-                    session_id=session_id,
-                    auth_context=ac,
-                    reason="ws_peer_message",
-                )
-            )
         write_jsonl(log_path, {
-            "type": "ws_peer.message_dispatched",
-            "ts": utc_ts(),
+            "type": "ws_peer.agent_turn_recorded",
+            "ts": now,
             "service_id": self_service["service_id"],
+            "peer_service_id": peer_service_id,
             "peer_username": peer_label,
             "target_username": username,
             "session_id": session_id,
-            "to_service": leased,
         })
         _send({"type": "message_accepted", "username": username, "session_id": session_id})
 
@@ -336,7 +365,10 @@ def handle_peer_connection(
             if handler is None:
                 _send({"type": "error", "message": f"unknown_type:{msg_type}"})
             else:
-                handler(msg)
+                try:
+                    handler(msg)
+                except Exception as exc:
+                    _send({"type": "error", "message": f"handler_error:{exc}"})
 
     finally:
         _closed.set()

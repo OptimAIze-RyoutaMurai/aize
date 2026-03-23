@@ -794,6 +794,9 @@ def make_handler(
         return "".join(parts)
 
     class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.1 is required for WebSocket upgrade (101 Switching Protocols)
+        protocol_version = "HTTP/1.1"
+
         def _set_session_cookie(self, token: str | None) -> None:
             parts = ["bridge_session="]
             if token:
@@ -1246,22 +1249,12 @@ def make_handler(
                 self_service=self_service,
                 process_id=process_id,
                 log_path=log_path,
-                default_target=default_target,
-                default_provider=default_provider,
-                codex_service_pool=codex_service_pool,
-                claude_service_pool=claude_service_pool,
                 append_history=append_history,
-                send_router_control=send_router_control,
-                make_dispatch_pending_message=make_dispatch_pending_message,
-                make_aize_pending_input=make_aize_pending_input,
-                append_pending_input=append_pending_input,
                 verify_user_password=verify_user_password,
-                issue_auth_context=issue_auth_context,
-                get_session_service=get_session_service,
-                lease_session_service=lease_session_service,
                 list_peer_joinable_sessions=list_peer_joinable_sessions,
                 register_history_subscriber=register_history_subscriber,
                 unregister_history_subscriber=unregister_history_subscriber,
+                record_session_agent_contact=record_session_agent_contact,
                 write_jsonl=write_jsonl,
             )
 
