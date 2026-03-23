@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import select
+import socket
 import ssl
 import sys
 import threading
@@ -66,6 +67,7 @@ from runtime.persistent_state import (
     list_session_agent_contacts,
     load_claude_session,
     load_codex_session,
+    active_agent_priority,
     normalize_auto_compact_threshold_left_percent,
     record_session_agent_contact,
     resolve_session_agent_id,
@@ -211,6 +213,8 @@ goal_message = make_dispatch_pending_message
 goal_feedback_message = make_dispatch_pending_message
 goal_message = make_dispatch_pending_message(
 message_type="dispatch_pending"
+provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
+return lease_session_service(
 goal_audit_should_enqueue_agent_followup(
 previous_goal_text=previous_goal,
 previous_goal_id=previous_goal_id,
@@ -262,8 +266,7 @@ def run_http_service(
     self_service: dict,
     process_id: str,
     log_path: Path,
-    rx_port: Path,
-    tx_port: Path,
+    router_conn: Any = None,
 ) -> int:
     config = dict(self_service.get("config", {}))
     host = str(config.get("host", "127.0.0.1"))
@@ -302,7 +305,9 @@ def run_http_service(
     # Overview tracking: agent service currently running per "username::session_id"
     _active_agent_turns: dict[str, dict[str, Any]] = {}
     _active_agent_turns_lock = threading.Lock()
-    control_port = runtime_root / "ports" / "router.control"
+    from kernel.ipc import connect_to_router as _connect_to_router
+    if router_conn is None:
+        router_conn = _connect_to_router(runtime_root, self_service["service_id"])
     ensure_state(runtime_root)
     for released in release_nonrunnable_session_services(runtime_root):
         write_jsonl(
@@ -336,11 +341,8 @@ def run_http_service(
         append_user_history(runtime_root, username=username, session_id=session_id, entry=record, limit=history_limit)
 
     def send_router_control(message: dict[str, Any]) -> bool:
-        payload = encode_line(message).encode("utf-8")
-        fd: int | None = None
         try:
-            fd = os.open(control_port, os.O_RDWR | os.O_NONBLOCK)
-            os.write(fd, payload)
+            router_conn.write(encode_line(message))
             return True
         except OSError as exc:
             write_jsonl(
@@ -355,12 +357,6 @@ def run_http_service(
                 },
             )
             return False
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
 
     def enqueue_service_control(*, action: str, service_id: str, auth_context: dict[str, Any]) -> None:
         control_message = make_message(
@@ -451,17 +447,39 @@ def run_http_service(
         release_stale_session_bindings()
         leased_service_id = get_session_service(runtime_root, username=username, session_id=session_id)
         session_settings = get_session_settings(runtime_root, username=username, session_id=session_id) or {}
-        preferred_provider = str(session_settings.get("preferred_provider", default_provider)).strip().lower() or default_provider
-        provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
-        if leased_service_id and (not provider_pool or leased_service_id in provider_pool):
-            return leased_service_id
-        if provider_pool:
-            return lease_session_service(
+
+        # Build ordered provider list from agent_priority; fall back to preferred_provider
+        agent_priority = active_agent_priority(session_settings.get("agent_priority"))
+        if not agent_priority:
+            preferred_provider = str(session_settings.get("preferred_provider", default_provider)).strip().lower() or default_provider
+            agent_priority = [preferred_provider]
+
+        pool_for_kind: dict[str, list[str]] = {"codex": codex_service_pool, "claude": claude_service_pool}
+
+        # If already leased, keep it if it belongs to any provider in the priority list
+        if leased_service_id:
+            for provider in agent_priority:
+                pool = pool_for_kind.get(provider, [])
+                if leased_service_id in pool:
+                    return leased_service_id
+
+        # Try to lease from pools in priority order.
+        # lease_session_service handles session_priority-based preemption: if all slots are
+        # taken but the current session outranks the lowest-priority holder, that holder's
+        # lease is revoked and the slot is granted here.
+        for provider in agent_priority:
+            pool = pool_for_kind.get(provider, [])
+            if not pool:
+                continue
+            svc = lease_session_service(
                 runtime_root,
                 username=username,
                 session_id=session_id,
-                pool_service_ids=provider_pool,
+                pool_service_ids=pool,
             )
+            if svc:
+                return svc
+
         if isinstance(default_target, str) and default_target:
             return default_target
         return None
@@ -514,8 +532,12 @@ def run_http_service(
             return None, "goal_state_disallows_dispatch"
         to_service = resolve_session_service_for_dispatch(username=username, session_id=session_id)
         if not to_service:
-            preferred_provider = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
-            return None, f"no_available_{preferred_provider}_worker"
+            raw_ap = talk.get("agent_priority")
+            if isinstance(raw_ap, list) and raw_ap:
+                priority_label = "_then_".join(active_agent_priority(raw_ap)) or default_provider
+            else:
+                priority_label = str(talk.get("preferred_provider", default_provider)).strip().lower() or default_provider
+            return None, f"no_available_{priority_label}_worker"
         # Audit state is agent-side: block dispatch only if the agent is in panic
         agent_audit_state = load_agent_audit_state(
             runtime_root, service_id=to_service, username=username, session_id=session_id
@@ -970,7 +992,6 @@ def run_http_service(
         _active_goal_audits_lock=_active_goal_audits_lock,
         _active_agent_turns=_active_agent_turns,
         _active_agent_turns_lock=_active_agent_turns_lock,
-        control_port=control_port,
         release_stale_session_bindings=release_stale_session_bindings,
         subscriber_key=subscriber_key,
         append_history=append_history,
@@ -997,7 +1018,22 @@ def run_http_service(
         request_positive_int=request_positive_int,
         current_context=current_context,
     )
-    server = ThreadingHTTPServer((host, port), Handler)
+    bind_host = host
+    server_class = ThreadingHTTPServer
+    if host == "0.0.0.0" and getattr(socket, "has_dualstack_ipv6", lambda: False)():
+        class DualStackThreadingHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+            def server_bind(self) -> None:
+                try:
+                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass
+                super().server_bind()
+
+        server_class = DualStackThreadingHTTPServer
+        bind_host = "::"
+    server = server_class((bind_host, port), Handler)
     if tls_enabled:
         if not tls_cert.exists() or not tls_key.exists():
             from tls.gen_self_signed_cert import generate_self_signed_cert
@@ -1029,14 +1065,14 @@ def run_http_service(
             "service_id": self_service["service_id"],
             "process_id": process_id,
             "host": host,
+            "bind_host": bind_host,
             "port": port,
             "tls": tls_enabled,
             "default_target": default_target,
         },
     )
 
-    rx_fd = os.open(rx_port, os.O_RDWR | os.O_NONBLOCK)
-    tx_fd = os.open(tx_port, os.O_RDWR | os.O_NONBLOCK)
+    rx_fd = router_conn.fileno()
     try:
         while not stopped.is_set():
             drained: list[dict[str, Any]] = []
@@ -1102,7 +1138,7 @@ def run_http_service(
                         session_id=session_id,
                         auth_context=batch[-1].get("auth"),
                     )
-                    os.write(tx_fd, encode_line(message).encode("utf-8"))
+                    router_conn.write(encode_line(message))
                     awaiting_replies.append(
                         {
                             "username": username,
@@ -1196,8 +1232,7 @@ def run_http_service(
     finally:
         server.shutdown()
         server.server_close()
-        os.close(rx_fd)
-        os.close(tx_fd)
+        router_conn.close()
     return 0
 
 
@@ -1215,8 +1250,6 @@ def main() -> int:
     self_service = wait_for_service_record(runtime_root, args.service_id)
     process_id = make_process_id(args.service_id)
     log_path = logs_dir / f"{args.service_id}.jsonl"
-    rx_port = ports_dir / f"{args.service_id}.rx"
-    tx_port = ports_dir / f"{args.service_id}.tx"
     register_process(
         runtime_root,
         process_id=process_id,
@@ -1242,6 +1275,9 @@ def main() -> int:
         process_id=process_id,
         fields={"os_pid": os.getpid()},
     )
+    from kernel.ipc import connect_to_router
+    router_conn = connect_to_router(runtime_root, args.service_id)
+
     if self_service["kind"] == "codex":
         ensure_state(runtime_root)
         update_process_fields(
@@ -1256,7 +1292,7 @@ def main() -> int:
             process_id=process_id,
             log_path=log_path,
             service_id=args.service_id,
-            tx_port=tx_port,
+            router_conn=router_conn,
             service_kind="codex",
         )
     elif self_service["kind"] == "claude":
@@ -1272,7 +1308,7 @@ def main() -> int:
             process_id=process_id,
             log_path=log_path,
             service_id=args.service_id,
-            tx_port=tx_port,
+            router_conn=router_conn,
             service_kind="claude",
         )
 
@@ -1288,16 +1324,17 @@ def main() -> int:
     )
 
     try:
+        from services import load_service_handler
+        run_service = load_service_handler(self_service["kind"])
+        rc = run_service(
+            runtime_root=runtime_root,
+            manifest=manifest,
+            self_service=self_service,
+            process_id=process_id,
+            log_path=log_path,
+            router_conn=router_conn,
+        )
         if self_service["kind"] == "http":
-            rc = run_http_service(
-                runtime_root=runtime_root,
-                manifest=manifest,
-                self_service=self_service,
-                process_id=process_id,
-                log_path=log_path,
-                rx_port=rx_port,
-                tx_port=tx_port,
-            )
             update_service_process(
                 runtime_root,
                 service_id=args.service_id,
@@ -1312,17 +1349,7 @@ def main() -> int:
                 status="stopped",
                 reason="http_service_stopped",
             )
-            return rc
-
-        return run_agent_service(
-            runtime_root=runtime_root,
-            manifest=manifest,
-            self_service=self_service,
-            process_id=process_id,
-            log_path=log_path,
-            rx_port=rx_port,
-            tx_port=tx_port,
-        )
+        return rc
     except Exception as exc:
         write_jsonl(
             log_path,
