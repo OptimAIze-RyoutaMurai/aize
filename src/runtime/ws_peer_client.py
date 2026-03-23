@@ -82,8 +82,10 @@ def _ws_upgrade(host: str, port: int, path: str, use_tls: bool) -> tuple[socket.
         ctx.verify_mode = ssl.CERT_NONE
         sock = ctx.wrap_socket(sock, server_hostname=host)
 
-    # Switch to blocking mode so the receive loop doesn't time out on quiet periods.
-    sock.settimeout(None)
+    # Use a long read timeout so quiet periods don't drop the connection;
+    # the keepalive ping thread sends a ping every PING_INTERVAL seconds so
+    # we'll always see traffic within 2*PING_INTERVAL.
+    sock.settimeout(max(PING_INTERVAL * 3, 120))
 
     # Make rfile/wfile from the socket
     rfile = sock.makefile("rb")
@@ -156,118 +158,115 @@ def _dispatch_to_local_llm(
 
     Returns the first ``direction="in"`` text seen in the local session history
     after the dispatch, or None on timeout / error.
+
+    NOTE: The agent response is written by a different process (service-claude-*)
+    so we poll the on-disk history rather than using in-process queue subscribers.
     """
     from kernel.auth import issue_auth_context
     from runtime.message_builder import make_aize_pending_input, make_dispatch_pending_message
     from runtime.persistent_state_pkg import (
         append_pending_input,
+        get_history,
         get_session_service,
         lease_session_service,
-        register_history_subscriber,
-        unregister_history_subscriber,
     )
 
     auth_context = issue_auth_context(runtime_root, username=local_username)
+    dispatch_ts = utc_ts()
 
-    # Subscribe to local history BEFORE dispatching so we don't miss the reply.
-    sub_q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-    register_history_subscriber(
-        username=local_username,
-        session_id=local_session_id,
-        subscriber=sub_q,
+    # Lease a local LLM service for the proxy session.
+    leased_service_id = get_session_service(
+        runtime_root, username=local_username, session_id=local_session_id
     )
-
-    try:
-        # Lease a local LLM service for the proxy session.
-        leased_service_id = get_session_service(
-            runtime_root, username=local_username, session_id=local_session_id
-        )
-        if leased_service_id and provider_pool and leased_service_id not in provider_pool:
-            leased_service_id = None
-        if not leased_service_id:
-            leased_service_id = lease_session_service(
-                runtime_root,
-                username=local_username,
-                session_id=local_session_id,
-                pool_service_ids=provider_pool,
-            )
-        if not leased_service_id:
-            write_jsonl_fn(log_path, {
-                "type": "ws_peer_client.dispatch_failed",
-                "ts": utc_ts(),
-                "reason": "no_available_provider_worker",
-                "local_session_id": local_session_id,
-            })
-            return None
-
-        # Write the user message to local history and pending inputs.
-        now = utc_ts()
-        append_history(local_username, local_session_id, {
-            "direction": "out",
-            "ts": now,
-            "to": leased_service_id,
-            "session_id": local_session_id,
-            "text": prompt_text,
-        })
-        append_pending_input(
+    if leased_service_id and provider_pool and leased_service_id not in provider_pool:
+        leased_service_id = None
+    if not leased_service_id:
+        leased_service_id = lease_session_service(
             runtime_root,
             username=local_username,
             session_id=local_session_id,
-            entry=make_aize_pending_input(
-                kind="user_message",
-                role="user",
-                text=prompt_text,
-            ),
+            pool_service_ids=provider_pool,
         )
-
-        # Send dispatch control message to the router.
-        dispatch_msg = make_dispatch_pending_message(
-            manifest=manifest,
-            from_service_id=self_service["service_id"],
-            to_service_id=leased_service_id,
-            process_id=process_id,
-            run_id=manifest["run_id"],
-            username=local_username,
-            session_id=local_session_id,
-            auth_context=auth_context,
-            reason="ws_peer_client_prompt",
-        )
-        if not _send_router_control(runtime_root, dispatch_msg):
-            write_jsonl_fn(log_path, {
-                "type": "ws_peer_client.dispatch_failed",
-                "ts": utc_ts(),
-                "reason": "router_control_send_failed",
-                "local_session_id": local_session_id,
-            })
-            return None
-
-        # Wait for a direction="in" reply from the local LLM.
-        deadline = time.monotonic() + RESPONSE_TIMEOUT
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            try:
-                entry = sub_q.get(timeout=min(remaining, 5.0))
-            except queue.Empty:
-                continue
-            if (
-                isinstance(entry, dict)
-                and entry.get("direction") == "in"
-                and entry.get("session_id") == local_session_id
-            ):
-                return str(entry.get("text", "")).strip()
-        # Timeout
+    if not leased_service_id:
         write_jsonl_fn(log_path, {
-            "type": "ws_peer_client.response_timeout",
+            "type": "ws_peer_client.dispatch_failed",
             "ts": utc_ts(),
+            "reason": "no_available_provider_worker",
             "local_session_id": local_session_id,
         })
         return None
-    finally:
-        unregister_history_subscriber(
-            username=local_username,
-            session_id=local_session_id,
-            subscriber=sub_q,
-        )
+
+    # Write the user message to local history and pending inputs.
+    append_history(local_username, local_session_id, {
+        "direction": "out",
+        "ts": dispatch_ts,
+        "to": leased_service_id,
+        "session_id": local_session_id,
+        "text": prompt_text,
+    })
+    append_pending_input(
+        runtime_root,
+        username=local_username,
+        session_id=local_session_id,
+        entry=make_aize_pending_input(
+            kind="user_message",
+            role="user",
+            text=prompt_text,
+        ),
+    )
+
+    # Send dispatch control message to the router.
+    dispatch_msg = make_dispatch_pending_message(
+        manifest=manifest,
+        from_service_id=self_service["service_id"],
+        to_service_id=leased_service_id,
+        process_id=process_id,
+        run_id=manifest["run_id"],
+        username=local_username,
+        session_id=local_session_id,
+        auth_context=auth_context,
+        reason="ws_peer_client_prompt",
+    )
+    if not _send_router_control(runtime_root, dispatch_msg):
+        write_jsonl_fn(log_path, {
+            "type": "ws_peer_client.dispatch_failed",
+            "ts": utc_ts(),
+            "reason": "router_control_send_failed",
+            "local_session_id": local_session_id,
+        })
+        return None
+
+    # Poll the on-disk session history for the response.
+    # The agent response is written by a separate process (service-claude-*), so
+    # in-process queue subscribers won't see it — we must read from disk.
+    deadline = time.monotonic() + RESPONSE_TIMEOUT
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        try:
+            history = get_history(
+                runtime_root,
+                username=local_username,
+                session_id=local_session_id,
+            )
+        except Exception:
+            continue
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("direction") != "in":
+                continue
+            if str(entry.get("session_id", "")) != local_session_id:
+                continue
+            entry_ts = str(entry.get("ts", ""))
+            if entry_ts > dispatch_ts:
+                return str(entry.get("text", "")).strip()
+    # Timeout
+    write_jsonl_fn(log_path, {
+        "type": "ws_peer_client.response_timeout",
+        "ts": utc_ts(),
+        "local_session_id": local_session_id,
+    })
+    return None
 
 
 def run_ws_peer_client(
