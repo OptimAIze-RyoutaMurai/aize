@@ -84,6 +84,7 @@ def goal_state_response_payload(
         "goal_manager_service_id": str(goal_manager_service_id or ""),
         "goal_manager_worker": goal_manager_worker if isinstance(goal_manager_worker, dict) else None,
         "welcomed_agents": welcomed_agents if welcomed_agents is not None else list(talk.get("welcomed_agents", [])) if isinstance(talk.get("welcomed_agents"), list) else [],
+        "selected_agents": list(talk.get("selected_agents", [])) if isinstance(talk.get("selected_agents"), list) else [],
     }
 
 

@@ -125,6 +125,7 @@ from .conversation import (
     session_group_permissions,
     session_operation_allowed,
     update_session_peer_joinable,
+    update_session_selected_agents,
     list_peer_joinable_sessions,
 )
 
@@ -248,6 +249,7 @@ __all__ = [
     "session_group_permissions",
     "session_operation_allowed",
     "update_session_peer_joinable",
+    "update_session_selected_agents",
     "list_peer_joinable_sessions",
     # Agent audit
     "load_agent_audit_state",

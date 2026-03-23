@@ -48,6 +48,7 @@ from runtime.persistent_state import (
     update_session_goal,
     update_session_goal_flags,
     update_session_peer_joinable,
+    update_session_selected_agents,
 )
 from runtime.session_view import (
     build_worker_count_summary,
@@ -946,6 +947,7 @@ def make_handler(
             initial_preferred_provider = str(session_settings.get("preferred_provider", default_provider))
             initial_agent_welcome_enabled = bool(session_settings.get("agent_welcome_enabled", False))
             initial_welcomed_agents = list_session_agent_contacts(runtime_root, username=username, session_id=session_id)
+            initial_selected_agents = list(session_settings.get("selected_agents", [])) if isinstance(session_settings.get("selected_agents"), list) else []
             initial_goal_manager_state = _goal_manager_runtime_payload(
                 username=username,
                 session_id=session_id,
@@ -1027,6 +1029,7 @@ def make_handler(
                     initial_goal_manager_state=str(initial_goal_manager_state),
                     initial_agent_welcome_enabled=initial_agent_welcome_enabled,
                     initial_welcomed_agents=initial_welcomed_agents,
+                    initial_selected_agents=initial_selected_agents,
                     recent_messages_limit_max=MAX_HTTPBRIDGE_RECENT_MESSAGES_LIMIT,
                     initial_session_summaries_json=initial_session_summaries_json,
                     initial_worker_counts_json=initial_worker_counts_json,
@@ -1310,6 +1313,8 @@ def make_handler(
                 return self._do_POST_session_agent_welcome(payload)
             if self.path == "/session/peer-joinable":
                 return self._do_POST_session_peer_joinable(payload)
+            if self.path == "/session/selected-agents":
+                return self._do_POST_session_selected_agents(payload)
             if self.path != "/message":
                 self._json(404, {"error": "not_found"})
                 return
@@ -1881,6 +1886,27 @@ def make_handler(
                 return
             self._json(200, {"ok": True, "session_id": session_id, "peer_joinable": flag})
 
+        def _do_POST_session_selected_agents(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            username = context["username"]
+            session_id = context["session_id"]
+            selected_agents = payload.get("selected_agents")
+            if not isinstance(selected_agents, list):
+                self._json(400, {"error": "selected_agents_list_required"})
+                return
+            result = update_session_selected_agents(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                selected_agents=selected_agents,
+            )
+            if not result:
+                self._json(404, {"error": "session_not_found"})
+                return
+            self._json(200, {"ok": True, "session_id": session_id, "selected_agents": result.get("selected_agents", [])})
+
         def _do_POST_message(self, payload: dict, content_type: str) -> None:
             context = self._require_user(payload=payload)
             if not context:
@@ -2034,13 +2060,29 @@ def make_handler(
                         str(session_settings.get("preferred_provider", default_provider)).strip().lower()
                         or default_provider
                     )
+                    # selected_agents overrides provider routing when present.
+                    # If the list contains only WS-peer service_ids (no pool token)
+                    # we skip the local LLM entirely — the subscribed WS peer will
+                    # receive the session_event and respond via its event pump.
+                    selected_agents_cfg = list(session_settings.get("selected_agents", []))
+                    ws_only_mode = bool(selected_agents_cfg) and not any(
+                        a in {"codex_pool", "claude_pool"} for a in selected_agents_cfg
+                    )
                     provider_pool = codex_service_pool if preferred_provider == "codex" else claude_service_pool
+                    # When codex_pool or claude_pool is explicitly selected, prefer that pool.
+                    if "codex_pool" in selected_agents_cfg:
+                        provider_pool = codex_service_pool
+                    elif "claude_pool" in selected_agents_cfg:
+                        provider_pool = claude_service_pool
                     leased_service_id = get_session_service(
                         runtime_root,
                         username=username,
                         session_id=session_id,
                     )
-                    if requested_to_service == default_target and (codex_service_pool or claude_service_pool):
+                    if ws_only_mode:
+                        # No local LLM worker — WS peer handles this session
+                        to_service = None
+                    elif requested_to_service == default_target and (codex_service_pool or claude_service_pool):
                         if leased_service_id and provider_pool and leased_service_id not in provider_pool:
                             leased_service_id = None
                         if not leased_service_id:

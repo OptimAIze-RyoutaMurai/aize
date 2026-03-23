@@ -1048,6 +1048,35 @@ def update_session_peer_joinable(
     return None
 
 
+def update_session_selected_agents(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    selected_agents: list[str],
+) -> dict[str, Any] | None:
+    """Set the active-agent list for a session.
+
+    ``selected_agents`` is a list of service_id strings or the special tokens
+    ``"codex_pool"`` and ``"claude_pool"``.  When it contains only WS-peer
+    service_ids (no pool token) the HTTP prompt dispatch skips the local LLM
+    workers and lets the subscribed WS peer respond via the event pump.
+    """
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
+                _ensure_session_defaults_unlocked(talk)
+                talk["selected_agents"] = [str(a) for a in selected_agents if a]
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+                return dict(talk)
+    return None
+
+
 def list_peer_joinable_sessions(runtime_root: Path) -> list[dict[str, Any]]:
     """Return all sessions across all users that have ``peer_joinable=True``.
 
