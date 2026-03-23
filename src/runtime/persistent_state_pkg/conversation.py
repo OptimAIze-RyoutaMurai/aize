@@ -1019,3 +1019,57 @@ def complete_session_child(
             "waiting_on_children": bool(remaining_children),
             "remaining_children": remaining_children,
         }
+
+
+def update_session_peer_joinable(
+    runtime_root: Path,
+    *,
+    username: str,
+    session_id: str,
+    peer_joinable: bool,
+) -> dict[str, Any] | None:
+    """Set or clear the peer_joinable flag on a session.
+
+    When ``peer_joinable`` is ``True`` the session is visible to remote AIze
+    peers connecting via ``/ws`` and they may join it as external agents.
+    """
+    normalized = normalize_username(username)
+    with state_lock(runtime_root):
+        state = _load_state_unlocked(runtime_root)
+        if not _ensure_session_exists_unlocked(state, normalized, session_id):
+            return None
+        for talk in _conversation_sessions(state).get(normalized, []):
+            if isinstance(talk, dict) and str(talk.get("session_id")) == session_id:
+                _ensure_session_defaults_unlocked(talk)
+                talk["peer_joinable"] = bool(peer_joinable)
+                talk["updated_at"] = utc_ts()
+                ensure_session_storage_unlocked(runtime_root, username=normalized, session=talk)
+                return dict(talk)
+    return None
+
+
+def list_peer_joinable_sessions(runtime_root: Path) -> list[dict[str, Any]]:
+    """Return all sessions across all users that have ``peer_joinable=True``.
+
+    Each entry includes a ``username`` key so remote peers know which user
+    owns the session.
+    """
+    result: list[dict[str, Any]] = []
+    sessions_root = sessions_dir(runtime_root)
+    with state_read_lock(runtime_root):
+        if not sessions_root.exists():
+            return result
+        for user_dir in sorted(path for path in sessions_root.iterdir() if path.is_dir()):
+            username = normalize_username(user_dir.name)
+            for session in _list_session_records(runtime_root, username=username):
+                if not bool(session.get("peer_joinable")):
+                    continue
+                entry = {
+                    "username": username,
+                    "session_id": str(session.get("session_id") or ""),
+                    "label": str(session.get("label") or session.get("session_id") or ""),
+                    "goal_text": str(session.get("goal_text") or ""),
+                    "peer_joinable": True,
+                }
+                result.append(entry)
+    return result

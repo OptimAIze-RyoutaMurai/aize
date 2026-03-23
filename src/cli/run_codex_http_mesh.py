@@ -73,6 +73,7 @@ def build_core_manifest() -> dict:
             "config": {
                 "host": HTTP_HOST,
                 "port": HTTP_PORT,
+                "tls_enabled": True,
                 "default_target": CODEX_POOL_SERVICE_IDS[0],
                 "default_provider": "codex",
                 "history_limit": 100,
@@ -232,12 +233,28 @@ def write_manifest(
 def bootstrap_runtime() -> dict:
     extra_services, extra_routes, restart_resume = capture_restorable_runtime()
     if RUNTIME_ROOT.exists():
+        # Preserve TLS certificates across restarts so manually-generated certs survive.
+        tls_dir = RUNTIME_ROOT / "tls"
+        saved_tls: dict[str, bytes] = {}
+        if tls_dir.exists():
+            for f in tls_dir.iterdir():
+                if f.is_file():
+                    saved_tls[f.name] = f.read_bytes()
         shutil.rmtree(RUNTIME_ROOT)
+    else:
+        saved_tls = {}
     PORTS.mkdir(parents=True)
     LOGS.mkdir(parents=True)
     OBJECTS.mkdir(parents=True)
     STATE.mkdir(parents=True)
     make_fifo(PORTS / "router.control")
+    if saved_tls:
+        tls_restore = RUNTIME_ROOT / "tls"
+        tls_restore.mkdir(parents=True, exist_ok=True)
+        for name, data in saved_tls.items():
+            dest = tls_restore / name
+            dest.write_bytes(data)
+            dest.chmod(0o600 if name.endswith(".key") else 0o644)
     manifest = write_manifest(extra_services=extra_services, extra_routes=extra_routes, restart_resume=restart_resume)
     for service in manifest["services"]:
         service_id = service["service_id"]

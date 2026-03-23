@@ -32,25 +32,47 @@ def _default_runtime_root() -> Path:
     return base / ".agent-mesh-runtime"
 
 
+def _build_san(extra_hosts: list[str] | None = None) -> str:
+    """Build a subjectAltName string covering localhost, 127.0.0.1, and any extra hosts."""
+    import ipaddress
+
+    dns_names = ["localhost"]
+    ip_addrs = ["127.0.0.1"]
+    for h in (extra_hosts or []):
+        h = h.strip()
+        if not h:
+            continue
+        try:
+            ipaddress.ip_address(h)
+            if h not in ip_addrs:
+                ip_addrs.append(h)
+        except ValueError:
+            if h not in dns_names:
+                dns_names.append(h)
+    parts = [f"DNS:{n}" for n in dns_names] + [f"IP:{a}" for a in ip_addrs]
+    return "subjectAltName=" + ",".join(parts)
+
+
 def generate_self_signed_cert(
     cert_path: Path,
     key_path: Path,
     *,
     days: int = 3650,
     cn: str = "localhost",
+    extra_hosts: list[str] | None = None,
 ) -> None:
     """Generate a self-signed cert+key pair using openssl.
 
     Creates parent directories as needed.  Overwrites existing files.
-    Adds SAN for DNS:localhost and IP:127.0.0.1 so modern browsers
-    and Python's ssl module accept the certificate.
+    Always adds SAN for DNS:localhost and IP:127.0.0.1.
+    Pass extra_hosts to include additional DNS names or IP addresses in the SAN.
     """
     cert_path = Path(cert_path)
     key_path = Path(key_path)
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.parent.mkdir(parents=True, exist_ok=True)
 
-    san = "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    san = _build_san(extra_hosts)
 
     # Try modern openssl (>=1.1.1) first: supports -addext inline
     result = subprocess.run(
@@ -110,11 +132,13 @@ def main() -> int:
     parser.add_argument("--key", default=str(tls_dir / "server.key"), help="Output path for the private key (PEM)")
     parser.add_argument("--days", type=int, default=3650, help="Certificate validity in days (default: 3650)")
     parser.add_argument("--cn", default="localhost", help="Common name (default: localhost)")
+    parser.add_argument("--hosts", nargs="*", default=[], metavar="HOST",
+                        help="Additional DNS names or IP addresses to add to the SAN (space-separated)")
     args = parser.parse_args()
 
     cert_path = Path(args.cert)
     key_path = Path(args.key)
-    generate_self_signed_cert(cert_path, key_path, days=args.days, cn=args.cn)
+    generate_self_signed_cert(cert_path, key_path, days=args.days, cn=args.cn, extra_hosts=args.hosts)
     print(f"cert: {cert_path}")
     print(f"key:  {key_path}")
     return 0

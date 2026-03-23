@@ -31,6 +31,7 @@ from runtime.persistent_state import (
     get_session_settings,
     get_history as get_user_history,
     lease_session_service,
+    list_peer_joinable_sessions,
     release_session_service,
     list_all_sessions_with_users,
     list_session_agent_contacts,
@@ -46,6 +47,7 @@ from runtime.persistent_state import (
     update_session_auto_compact_threshold,
     update_session_goal,
     update_session_goal_flags,
+    update_session_peer_joinable,
 )
 from runtime.session_view import (
     build_worker_count_summary,
@@ -846,6 +848,8 @@ def make_handler(
 
         def do_GET(self) -> None:
             path, query = request_parts(self)
+            if path == "/ws":
+                return self._do_WS_upgrade()
             if path == "/":
                 return self._do_GET_root(path, query)
             if path == "/events":
@@ -1214,6 +1218,53 @@ def make_handler(
             )
             return
 
+        def _do_WS_upgrade(self) -> None:
+            from runtime.ws_bridge import compute_accept_key
+            from runtime.ws_peer_handler import handle_peer_connection
+
+            upgrade = str(self.headers.get("Upgrade", "")).strip().lower()
+            if upgrade != "websocket":
+                self._json(400, {"error": "websocket_upgrade_required"})
+                return
+            ws_key = str(self.headers.get("Sec-WebSocket-Key", "")).strip()
+            if not ws_key:
+                self._json(400, {"error": "sec_websocket_key_required"})
+                return
+            accept_key = compute_accept_key(ws_key)
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_key)
+            self.end_headers()
+            # Block here until the WebSocket session ends
+            self.close_connection = True
+            handle_peer_connection(
+                rfile=self.rfile,
+                wfile=self.wfile,
+                runtime_root=runtime_root,
+                manifest=manifest,
+                self_service=self_service,
+                process_id=process_id,
+                log_path=log_path,
+                default_target=default_target,
+                default_provider=default_provider,
+                codex_service_pool=codex_service_pool,
+                claude_service_pool=claude_service_pool,
+                append_history=append_history,
+                send_router_control=send_router_control,
+                make_dispatch_pending_message=make_dispatch_pending_message,
+                make_aize_pending_input=make_aize_pending_input,
+                append_pending_input=append_pending_input,
+                verify_user_password=verify_user_password,
+                issue_auth_context=issue_auth_context,
+                get_session_service=get_session_service,
+                lease_session_service=lease_session_service,
+                list_peer_joinable_sessions=list_peer_joinable_sessions,
+                register_history_subscriber=register_history_subscriber,
+                unregister_history_subscriber=unregister_history_subscriber,
+                write_jsonl=write_jsonl,
+            )
+
         def do_POST(self) -> None:
             content_type = self.headers.get("Content-Type", "")
             length = int(self.headers.get("Content-Length", "0"))
@@ -1264,6 +1315,8 @@ def make_handler(
                 return self._do_POST_service_control(payload)
             if self.path == "/session/agent/welcome":
                 return self._do_POST_session_agent_welcome(payload)
+            if self.path == "/session/peer-joinable":
+                return self._do_POST_session_peer_joinable(payload)
             if self.path != "/message":
                 self._json(404, {"error": "not_found"})
                 return
@@ -1812,6 +1865,28 @@ def make_handler(
             welcomed_agents = result.get("welcomed_agents", [])
             self._json(200, {"ok": True, "service_id": service_id, "provider": provider, "welcomed_agents": welcomed_agents})
             return
+
+        def _do_POST_session_peer_joinable(self, payload: dict) -> None:
+            context = self._require_user(payload=payload)
+            if not context:
+                return
+            username = context["username"]
+            session_id = context["session_id"]
+            raw_flag = payload.get("peer_joinable")
+            if raw_flag is None:
+                self._json(400, {"error": "peer_joinable_required"})
+                return
+            flag = bool(raw_flag) if isinstance(raw_flag, bool) else str(raw_flag).lower() in {"true", "1", "yes"}
+            result = update_session_peer_joinable(
+                runtime_root,
+                username=username,
+                session_id=session_id,
+                peer_joinable=flag,
+            )
+            if not result:
+                self._json(404, {"error": "session_not_found"})
+                return
+            self._json(200, {"ok": True, "session_id": session_id, "peer_joinable": flag})
 
         def _do_POST_message(self, payload: dict, content_type: str) -> None:
             context = self._require_user(payload=payload)
